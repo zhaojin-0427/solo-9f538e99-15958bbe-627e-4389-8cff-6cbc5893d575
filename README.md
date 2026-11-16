@@ -30,9 +30,10 @@ FHIR_DB_PATH=data/fhir.sqlite3 FHIR_BASE_URL=http://localhost:8000 \
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/` | 提交 `application/fhir+json` 的 transaction Bundle |
+| `POST` | `/merge` | 合并两个确认为同一人的 Patient（检验归属并入保留患者） |
 | `GET` | `/{Type}/{id}` | 按永久地址读取 Patient / Specimen / Observation |
 | `GET` | `/health` | 健康检查，返回库内资源数 |
-| `GET` | `/docs` | Swagger UI（含可直接执行的示例 Bundle） |
+| `GET` | `/docs` | Swagger UI（含可直接执行的示例 Bundle 与合并请求） |
 
 ### 请求示例
 
@@ -44,6 +45,53 @@ curl -s -X POST http://localhost:8000/ \
 
 成功时返回 `transaction-response` Bundle，`entry[i].response.location` 即该资源的永久地址，
 顺序与请求 `entry` 一致。每个响应项也回带 `fullUrl`，便于调用方对齐。
+
+### 患者合并
+
+数据员确认两个不同标识的 Patient 实为同一人时，调用 `POST /merge` 把源患者并入保留患者：
+
+```bash
+curl -s -X POST http://localhost:8000/merge \
+  -H 'content-type: application/json' \
+  --data-binary @examples/demo-merge.json | python3 -m json.tool
+```
+
+请求体为 JSON：`mergeId`（合并号，幂等键）、`source`（源患者）、`target`（保留患者）。
+`source` / `target` 可写裸 id、`Patient/<id>` 或永久地址 `<FHIR_BASE_URL>/Patient/<id>`。
+规则：
+
+* **前置校验**：双方都必须**存在且未被合并过**；源与目标不能是同一患者。目标必须未被合并
+  这一点同时保证了合并链**不可能成环**（成环必然要求并入一个已合并的患者）。
+* **保留患者不被改写**：其人口学信息与自身 identifier 列表保持原样，绝不覆盖、不追加。
+* **标识归并**：双方的全部 `identifier(system, value)` 此后都匹配保留患者（入仓身份匹配
+  直接命中保留患者）。
+* **检验归属改指**：库内已有 Specimen、Observation（及其他资源）中指向源患者地址的引用，
+  在同一事务内改写为保留患者地址；合并后新入仓的引用（即使仍写旧地址）也解析并落库为
+  保留患者的当前永久地址。同患者校验（Observation.subject 与标本所属患者）按合并后身份判断。
+* **旧地址可追溯**：`GET /Patient/<源患者id>` 仍返回 200，内容为当前保留患者。保留患者以后
+  可再被并入第三方，旧地址沿合并链追到**最终患者**。
+* **原子性**：校验、标识重指、引用改写、合并链记录与幂等记录在同一个 SQLite 事务里提交；
+  与入仓共用同一把写锁，交错执行时任一入仓看到的只有合并前或合并后的完整状态，失败或
+  重启不会留下半次合并。
+* **幂等**：同 `mergeId` 同参数重试返回**原始结果**（不重复改写）；同 `mergeId` 异参数返回
+  `409`。记录在 SQLite 中，重启后仍有效。失败的合并不占用合并号，修正后可用同一 `mergeId`
+  重试。
+
+成功响应示例：
+
+```json
+{
+  "mergeId": "merge-demo-0001",
+  "source": "http://localhost:8000/Patient/pat-duplicate",
+  "target": "http://localhost:8000/Patient/pat-retained",
+  "final": "http://localhost:8000/Patient/pat-retained",
+  "remappedIdentifiers": 1,
+  "updatedResources": 3
+}
+```
+
+注意：合并**不会**改写已记录的 `Bundle.id` 幂等响应——用原 `Bundle.id` 重试仍返回原响应
+映射（其中可能是旧地址），也不会重建资源；旧地址本身仍可读、可解析到保留患者。
 
 ### 规则与实现取舍
 
@@ -78,11 +126,11 @@ curl -s -X POST http://localhost:8000/ \
 
 | 状态 | 含义 |
 | --- | --- |
-| `200` | 整包成功（含幂等重放） |
+| `200` | 整包成功（含幂等重放）；合并成功（含合并号重放） |
 | `400` | 请求体不是合法 JSON，或不是 JSON 对象 |
-| `409` | `Bundle.id` 异文冲突；或请求的 `resource.id` 已存在 |
+| `409` | `Bundle.id` 异文冲突；请求的 `resource.id` 已存在；`mergeId` 异参冲突 |
 | `413` / `415` | 请求体过大 / Content-Type 不支持 |
-| `422` | 包内容被拒（超 30 项、非 POST、类型不支持、悬空/歧义引用、患者/标本不匹配等） |
+| `422` | 包内容被拒（超 30 项、非 POST、类型不支持、悬空/歧义引用、患者/标本不匹配等）；合并被拒（患者不存在、已被合并、自合并等） |
 
 错误响应为 `application/fhir+json` 的 `OperationOutcome`，`issue[].expression` 尽量定位到
 具体 entry 字段。`422` 已使用 HTTP 语义的标准码，未采用 FHIR 规范中非标准的 `4xx`+`OperationOutcome`
@@ -108,4 +156,6 @@ python3 -m ruff check .
 
 测试覆盖：三类资源正常入库、前向引用、库内地址引用、引用改写、患者按标识复用且不改写、
 同身份 fullUrl 合并、身份歧义、悬空/类型错误/歧义引用、标本与结果患者一致性、30 项上限、
-非法 Bundle 形状、幂等重放与异文冲突、重启后幂等、多进程与多线程并发唯一患者、失败回滚。
+非法 Bundle 形状、幂等重放与异文冲突、重启后幂等、多进程与多线程并发唯一患者、失败回滚；
+患者合并的归属改指、旧地址追踪、链式合并与防环、合并号幂等与异参 409、合并后同患者校验、
+合并与入仓交错的一致性、合并状态跨重启保持。

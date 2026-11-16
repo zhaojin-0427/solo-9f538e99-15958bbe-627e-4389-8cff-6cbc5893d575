@@ -1,0 +1,5 @@
+{
+  "mergeId": "merge-demo-0001",
+  "source": "Patient/pat-duplicate",
+  "target": "Patient/pat-retained"
+}

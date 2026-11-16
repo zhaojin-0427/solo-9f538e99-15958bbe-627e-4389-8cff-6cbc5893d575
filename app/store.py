@@ -35,7 +35,48 @@ CREATE TABLE IF NOT EXISTS bundle_records (
     response    TEXT NOT NULL,
     created_at  REAL NOT NULL
 );
+
+-- Patient merges. source_id is the merged-away patient, target_id the retained
+-- patient at merge time. A patient appears as source at most once; targets are
+-- always live (unmerged) patients, so chains are acyclic by construction.
+CREATE TABLE IF NOT EXISTS patient_merges (
+    source_id  TEXT PRIMARY KEY,
+    target_id  TEXT NOT NULL,
+    merge_id   TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+-- Idempotency of the merge API: merge number -> canonical body hash + response.
+CREATE TABLE IF NOT EXISTS merge_records (
+    merge_id    TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    response    TEXT NOT NULL,
+    created_at  REAL NOT NULL
+);
 """
+
+
+def final_patient_id(conn: sqlite3.Connection, patient_id: str) -> str:
+    """Follow the merge chain from ``patient_id`` to the live (retained) patient.
+
+    Merge targets are validated to be unmerged patients, so the chain is a
+    simple path. The visited set is a defensive guard: corrupt data raises
+    instead of looping forever.
+    """
+    seen = {patient_id}
+    current = patient_id
+    while True:
+        row = conn.execute(
+            "SELECT target_id FROM patient_merges WHERE source_id = ?", (current,)
+        ).fetchone()
+        if row is None:
+            return current
+        current = row["target_id"]
+        if current in seen:
+            raise RuntimeError(
+                f"Patient merge chain is cyclic at {current!r}; the merge log is corrupt"
+            )
+        seen.add(current)
 
 _lock_registry_guard = threading.Lock()
 _transaction_locks: dict[str, threading.Lock] = {}
@@ -119,6 +160,14 @@ class Store:
         conn = self._connect()
         try:
             return int(conn.execute("SELECT COUNT(*) FROM resources").fetchone()[0])
+        finally:
+            conn.close()
+
+    def final_patient_id(self, patient_id: str) -> str:
+        """The live patient a (possibly merged-away) patient id resolves to."""
+        conn = self._connect()
+        try:
+            return final_patient_id(conn, patient_id)
         finally:
             conn.close()
 

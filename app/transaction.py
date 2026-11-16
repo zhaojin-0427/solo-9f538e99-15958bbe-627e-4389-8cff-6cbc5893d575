@@ -14,9 +14,11 @@ Scope
   references allowed) or a permanent library address
   ``<FHIR_BASE_URL>/<Type>/<id>`` of an existing resource. Dangling or
   ambiguous references reject the whole bundle. Stored references are rewritten
-  to permanent addresses.
+  to permanent addresses. A merged-away Patient address resolves along the
+  merge chain to the retained patient (see ``app.merge``).
 * ``Specimen.subject`` must resolve to a Patient. ``Observation.subject`` and
   the patient behind ``Observation.specimen`` must be the same patient.
+  Patient identity comparisons use the post-merge identity.
 * Everything happens in one SQLite write transaction; a rejected bundle writes
   nothing.
 """
@@ -33,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import settings
-from .store import Store
+from .store import Store, final_patient_id
 
 SUPPORTED_TYPES = ("Patient", "Specimen", "Observation")
 SUPPORTED_TYPES_SET = frozenset(SUPPORTED_TYPES)
@@ -525,9 +527,16 @@ def _execute(conn: sqlite3.Connection, entries: list[Entry]) -> dict[str, Any]:
                 )
             resource_type, resource_id = parsed
             row = _resource_row(conn, resource_type, resource_id)
-            library_cache[reference] = (
-                None if row is None else (reference, resource_type)
-            )
+            if row is None:
+                library_cache[reference] = None
+            elif resource_type == "Patient":
+                # A merged-away patient's address keeps resolving: it now names
+                # the retained patient, so newly stored references carry the
+                # survivor's current permanent address.
+                final_id = final_patient_id(conn, resource_id)
+                library_cache[reference] = (_permanent("Patient", final_id), "Patient")
+            else:
+                library_cache[reference] = (reference, resource_type)
         cached = library_cache[reference]
         if cached is None:
             raise _fail(

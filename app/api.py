@@ -1,4 +1,5 @@
-"""HTTP layer: POST / (transaction), GET /<Type>/<id> (permanent read), /docs."""
+"""HTTP layer: POST / (transaction), POST /merge (patient merge),
+GET /<Type>/<id> (permanent read), /docs."""
 from __future__ import annotations
 
 import json
@@ -10,6 +11,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
 from . import settings
+from .merge import merge_patients
 from .store import Store
 from .transaction import SUPPORTED_TYPES_SET, BundleError, ingest
 
@@ -86,6 +88,13 @@ EXAMPLE_BUNDLE = {
 }
 
 
+EXAMPLE_MERGE = {
+    "mergeId": "merge-2026-0001",
+    "source": "Patient/pat-duplicate",
+    "target": "Patient/pat-retained",
+}
+
+
 def error_response(status: int, message: str,
                    issues: list[dict[str, Any]] | None = None,
                    headers: dict[str, str] | None = None) -> JSONResponse:
@@ -124,7 +133,17 @@ def create_app(store: Store | None = None) -> FastAPI:
             "bundle leaves no new resources.\n"
             "* **Idempotency** – an identical body with the same `Bundle.id` replays "
             "the original response; a different body with that `Bundle.id` returns "
-            "`409 Conflict`. The mapping survives restarts."
+            "`409 Conflict`. The mapping survives restarts.\n"
+            "* **Patient merge** – `POST /merge` with `mergeId`, `source` and "
+            "`target` folds two Patients confirmed to be the same person into the "
+            "retained one: both parties' identifiers then match the retained "
+            "patient, stored Specimen/Observation references are retargeted to the "
+            "retained patient's address, and the old patient address keeps "
+            "reading (and resolving to) the retained patient. The retained "
+            "patient's own resource is never rewritten. Merges chain (the "
+            "retained patient may be merged again later) and never cycle. The "
+            "same `mergeId` with the same body replays the original result; a "
+            "different body with that `mergeId` returns `409 Conflict`."
         ),
     )
     app.state.store = store
@@ -187,6 +206,75 @@ def create_app(store: Store | None = None) -> FastAPI:
         return JSONResponse(status_code=200, content=result,
                             media_type="application/fhir+json")
 
+    @app.post(
+        "/merge",
+        tags=["merge"],
+        summary="Merge two Patients confirmed to be the same person",
+        status_code=200,
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["mergeId", "source", "target"],
+                            "properties": {
+                                "mergeId": {
+                                    "type": "string",
+                                    "description": "Merge number; idempotency key",
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "description": "Merged-away patient: id, "
+                                                   "'Patient/<id>' or permanent address",
+                                },
+                                "target": {
+                                    "type": "string",
+                                    "description": "Retained patient: id, "
+                                                   "'Patient/<id>' or permanent address",
+                                },
+                            },
+                        },
+                        "example": EXAMPLE_MERGE,
+                    }
+                },
+            }
+        },
+        responses={
+            200: {"description": "Merge result (also used for idempotent replays)"},
+            400: {"description": "Malformed JSON"},
+            409: {"description": "mergeId conflict"},
+            413: {"description": "Body too large"},
+            415: {"description": "Unsupported Content-Type"},
+            422: {"description": "Merge rejected; OperationOutcome, nothing changed"},
+        },
+    )
+    async def post_merge(request: Request) -> Response:
+        content_type = (
+            (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+        )
+        if content_type not in {"application/json", "application/fhir+json"}:
+            return error_response(
+                415,
+                "Content-Type must be application/json",
+                headers={"Accept-Post": "application/json"},
+            )
+        body = await request.body()
+        if len(body) > settings.MAX_BODY_BYTES:
+            return error_response(413, "Request body is too large")
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return error_response(
+                400, "Request body is not valid JSON",
+                [{"severity": "error", "code": "invalid",
+                  "diagnostics": "Body is not valid JSON"}],
+            )
+        result = await run_in_threadpool(merge_patients, store, payload)
+        return JSONResponse(status_code=200, content=result,
+                            media_type="application/json")
+
     @app.get(
         "/{resource_type}/{resource_id}",
         tags=["read"],
@@ -210,6 +298,14 @@ def create_app(store: Store | None = None) -> FastAPI:
                 [{"severity": "error", "code": "not-found",
                   "diagnostics": f"{resource_type}/{resource_id} does not exist"}],
             )
+        if resource_type == "Patient":
+            # A merged-away patient's old address keeps reading the current
+            # retained patient, following the merge chain to the final one.
+            final_id = store.final_patient_id(resource_id)
+            if final_id != resource_id:
+                retained = store.get_resource("Patient", final_id)
+                if retained is not None:
+                    resource = retained
         return JSONResponse(status_code=200, content=resource,
                             media_type="application/fhir+json")
 
